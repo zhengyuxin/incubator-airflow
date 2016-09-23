@@ -44,6 +44,7 @@ from airflow.executors import DEFAULT_EXECUTOR
 from airflow.models import (DagModel, DagBag, TaskInstance,
                             DagPickle, DagRun, Variable, DagStat,
                             Pool)
+from airflow.ti_deps.dep_context import (DepContext, SCHEDULER_DEPS)
 from airflow.utils import db as db_utils
 from airflow.utils import logging as logging_utils
 from airflow.utils.state import State
@@ -154,8 +155,8 @@ def backfill(args, dag=None):
             local=args.local,
             donot_pickle=(args.donot_pickle or
                           conf.getboolean('core', 'donot_pickle')),
-            ignore_dependencies=args.ignore_dependencies,
             ignore_first_depends_on_past=args.ignore_first_depends_on_past,
+            ignore_task_deps=args.ignore_dependencies,
             pool=args.pool)
 
 
@@ -356,18 +357,20 @@ def run(args, dag=None):
         run_job = jobs.LocalTaskJob(
             task_instance=ti,
             mark_success=args.mark_success,
-            force=args.force,
             pickle_id=args.pickle,
-            ignore_dependencies=args.ignore_dependencies,
+            ignore_all_deps=args.ignore_all_dependencies,
             ignore_depends_on_past=args.ignore_depends_on_past,
+            ignore_task_deps=args.ignore_dependencies,
+            ignore_ti_state=args.force,
             pool=args.pool)
         run_job.run()
     elif args.raw:
         ti.run(
             mark_success=args.mark_success,
-            force=args.force,
-            ignore_dependencies=args.ignore_dependencies,
+            ignore_all_deps=args.ignore_all_dependencies,
             ignore_depends_on_past=args.ignore_depends_on_past,
+            ignore_task_deps=args.ignore_dependencies,
+            ignore_ti_state=args.force,
             job_id=args.job_id,
             pool=args.pool,
         )
@@ -396,9 +399,10 @@ def run(args, dag=None):
             ti,
             mark_success=args.mark_success,
             pickle_id=pickle_id,
-            ignore_dependencies=args.ignore_dependencies,
+            ignore_all_deps=args.ignore_all_dependencies,
             ignore_depends_on_past=args.ignore_depends_on_past,
-            force=args.force,
+            ignore_task_deps=args.ignore_dependencies,
+            ignore_ti_state=args.force,
             pool=args.pool)
         executor.heartbeat()
         executor.end()
@@ -442,6 +446,31 @@ def run(args, dag=None):
         elif remote_base and remote_base != 'None':
             logging.error(
                 'Unsupported remote log location: {}'.format(remote_base))
+
+
+def task_failed_deps(args):
+    """
+    Returns the unmet dependencies for a task instance from the perspective of the
+    scheduler (i.e. why a task instance doesn't get scheduled and then queued by the
+    scheduler, and then run by an executor).
+
+    >>> airflow task_failed_deps tutorial sleep 2015-01-01
+    Task instance dependencies not met:
+    Dagrun Running: Task instance's dagrun did not exist: Unknown reason
+    Trigger Rule: Task's trigger rule 'all_success' requires all upstream tasks to have succeeded, but found 1 non-success(es).
+    """
+    dag = get_dag(args)
+    task = dag.get_task(task_id=args.task_id)
+    ti = TaskInstance(task, args.execution_date)
+
+    dep_context = DepContext(deps=SCHEDULER_DEPS)
+    failed_deps = list(ti.get_failed_dep_statuses(dep_context=dep_context))
+    if failed_deps:
+        print("Task instance dependencies not met:")
+        for dep in failed_deps:
+            print("{}: {}".format(dep.dep_name, dep.reason))
+    else:
+        print("Task instance dependencies are all met.")
 
 
 def task_state(args):
@@ -505,7 +534,7 @@ def test(args, dag=None):
     if args.dry_run:
         ti.dry_run()
     else:
-        ti.run(force=True, ignore_dependencies=True, test_mode=True)
+        ti.run(ignore_task_deps=True, ignore_ti_state=True, test_mode=True)
 
 
 def render(args):
@@ -661,12 +690,21 @@ def webserver(args):
     num_workers = args.workers or conf.get('webserver', 'workers')
     worker_timeout = (args.worker_timeout or
                       conf.get('webserver', 'webserver_worker_timeout'))
+    ssl_cert = args.ssl_cert or conf.get('webserver', 'web_server_ssl_cert')
+    ssl_key = args.ssl_key or conf.get('webserver', 'web_server_ssl_key')
+    if ssl_cert is None and ssl_key is not None:
+        raise AirflowException(
+            'An SSL certificate must also be provided for use with ' + ssl_key)
+    if ssl_cert is not None and ssl_key is None:
+        raise AirflowException(
+            'An SSL key must also be provided for use with ' + ssl_cert)
 
     if args.debug:
         print(
             "Starting the web server on port {0} and host {1}.".format(
                 args.port, args.hostname))
-        app.run(debug=True, port=args.port, host=args.hostname)
+        app.run(debug=True, port=args.port, host=args.hostname,
+                ssl_context=(ssl_cert, ssl_key))
     else:
         pid, stdout, stderr, log_file = setup_locations("webserver", pid=args.pid)
         print(
@@ -698,6 +736,8 @@ def webserver(args):
 
         if args.daemon:
             run_args += ["-D"]
+        if ssl_cert:
+            run_args += ['--certfile', ssl_cert, '--keyfile', ssl_key]
 
         run_args += ["airflow.www.app:cached_app()"]
 
@@ -1063,13 +1103,32 @@ class CLIFactory(object):
             ("-kt", "--keytab"), "keytab",
             nargs='?', default=conf.get('kerberos', 'keytab')),
         # run
+        # TODO(aoen): "force" is a poor choice of name here since it implies it overrides
+        # all dependencies (not just past success), e.g. the ignore_depends_on_past
+        # dependency. This flag should be deprecated and renamed to 'ignore_ti_state' and
+        # the "ignore_all_dependencies" command should be called the"force" command
+        # instead.
         'force': Arg(
             ("-f", "--force"),
-            "Force a run regardless of previous success", "store_true"),
+            "Ignore previous task instance state, rerun regardless if task already "
+            "succeeded/failed",
+            "store_true"),
         'raw': Arg(("-r", "--raw"), argparse.SUPPRESS, "store_true"),
+        'ignore_all_dependencies': Arg(
+            ("-A", "--ignore_all_dependencies"),
+            "Ignores all non-critical dependencies, including ignore_ti_state and "
+            "ignore_task_deps"
+            "store_true"),
+        # TODO(aoen): ignore_dependencies is a poor choice of name here because it is too
+        # vague (e.g. a task being in the appropriate state to be run is also a dependency
+        # but is not ignored by this flag), the name 'ignore_task_dependencies' is
+        # slightly better (as it ignores all dependencies that are specific to the task),
+        # so deprecate the old command name and use this instead.
         'ignore_dependencies': Arg(
             ("-i", "--ignore_dependencies"),
-            "Ignore upstream and depends_on_past dependencies", "store_true"),
+            "Ignore task-specific dependencies, e.g. upstream, depends_on_past, and "
+            "retry delay dependencies",
+            "store_true"),
         'ignore_depends_on_past': Arg(
             ("-I", "--ignore_depends_on_past"),
             "Ignore depends_on_past dependencies (but respect "
@@ -1089,6 +1148,14 @@ class CLIFactory(object):
             default=conf.get('webserver', 'WEB_SERVER_PORT'),
             type=int,
             help="The port on which to run the server"),
+        'ssl_cert': Arg(
+            ("--ssl_cert", ),
+            default=conf.get('webserver', 'WEB_SERVER_SSL_CERT'),
+            help="Path to the SSL certificate for the webserver"),
+        'ssl_key': Arg(
+            ("--ssl_key", ),
+            default=conf.get('webserver', 'WEB_SERVER_SSL_KEY'),
+            help="Path to the key to use with the SSL certificate"),
         'workers': Arg(
             ("-w", "--workers"),
             default=conf.get('webserver', 'WORKERS'),
@@ -1229,7 +1296,7 @@ class CLIFactory(object):
             'args': (
                 'dag_id', 'task_id', 'execution_date', 'subdir',
                 'mark_success', 'force', 'pool',
-                'local', 'raw', 'ignore_dependencies',
+                'local', 'raw', 'ignore_all_dependencies', 'ignore_dependencies',
                 'ignore_depends_on_past', 'ship_dag', 'pickle', 'job_id'),
         }, {
             'func': initdb,
@@ -1243,6 +1310,14 @@ class CLIFactory(object):
             'func': dag_state,
             'help': "Get the status of a dag run",
             'args': ('dag_id', 'execution_date', 'subdir'),
+        }, {
+            'func': task_failed_deps,
+            'help': (
+                "Returns the unmet dependencies for a task instance from the perspective "
+                "of the scheduler. In other words, why a task instance doesn't get "
+                "scheduled and then queued by the scheduler, and then run by an "
+                "executor)."),
+            'args': ('dag_id', 'task_id', 'execution_date', 'subdir'),
         }, {
             'func': task_state,
             'help': "Get the status of a task instance",
@@ -1264,7 +1339,7 @@ class CLIFactory(object):
             'help': "Start a Airflow webserver instance",
             'args': ('port', 'workers', 'workerclass', 'worker_timeout', 'hostname',
                      'pid', 'daemon', 'stdout', 'stderr', 'access_logfile',
-                     'error_logfile', 'log_file', 'debug'),
+                     'error_logfile', 'log_file', 'ssl_cert', 'ssl_key', 'debug'),
         }, {
             'func': resetdb,
             'help': "Burn down and rebuild the metadata database",

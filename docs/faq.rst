@@ -29,7 +29,7 @@ Here are some of the common causes:
   needs to have succeeded (except if it is the first run for that task).
   Also, if ``wait_for_downstream=True``, make sure you understand
   what it means.
-  You can view how these properties are set from the ``Task Details``
+  You can view how these properties are set from the ``Task Instance Details``
   page for your task.
 
 - Are the DagRuns you need created and active? A DagRun represents a specific
@@ -135,7 +135,7 @@ There are many layers of ``airflow run`` commands, meaning it can call itself.
   command in the queue for it to run remote, on the worker. If using
   LocalExecutor, that translates into running it in a subprocess pool.
 - Local ``airflow run --local``: starts an ``airflow run --raw``
-  command (described bellow) as a subprocess and is in charge of
+  command (described below) as a subprocess and is in charge of
   emitting heartbeats, listening for external kill signals
   and ensures some cleanup takes place if the subprocess fails
 - Raw ``airflow run --raw`` runs the actual operator's execute method and
